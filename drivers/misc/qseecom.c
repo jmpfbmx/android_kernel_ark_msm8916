@@ -6570,6 +6570,86 @@ static int __qseecom_qteec_issue_cmd(struct qseecom_dev_handle *data,
 	else
 		*(uint32_t *)cmd_buf = cmd_id;
 
+	req_ptr = req->req_ptr;
+	resp_ptr = req->resp_ptr;
+
+	/* find app_id & img_name from list */
+	spin_lock_irqsave(&qseecom.registered_app_list_lock, flags);
+	list_for_each_entry(ptr_app, &qseecom.registered_app_list_head,
+							list) {
+		if ((ptr_app->app_id == data->client.app_id) &&
+			 (!strcmp(ptr_app->app_name, data->client.app_name))) {
+			found_app = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&qseecom.registered_app_list_lock, flags);
+	if (!found_app) {
+		pr_err("app_id %d (%s) is not found\n", data->client.app_id,
+			(char *)data->client.app_name);
+		return -ENOENT;
+	}
+
+	req->req_ptr = (void *)__qseecom_uvirt_to_kvirt(data,
+						(uintptr_t)req->req_ptr);
+	req->resp_ptr = (void *)__qseecom_uvirt_to_kvirt(data,
+						(uintptr_t)req->resp_ptr);
+
+	if ((cmd_id == QSEOS_TEE_OPEN_SESSION) ||
+			(cmd_id == QSEOS_TEE_REQUEST_CANCELLATION)) {
+		ret = __qseecom_update_qteec_req_buf(
+			(struct qseecom_qteec_modfd_req *)req, data, false);
+		if (ret)
+			return ret;
+	}
+
+	if (qseecom.qsee_version < QSEE_VERSION_40) {
+		ireq.app_id = data->client.app_id;
+		ireq.req_ptr = (uint32_t)__qseecom_uvirt_to_kphys(data,
+						(uintptr_t)req_ptr);
+		ireq.req_len = req->req_len;
+		ireq.resp_ptr = (uint32_t)__qseecom_uvirt_to_kphys(data,
+						(uintptr_t)resp_ptr);
+		ireq.resp_len = req->resp_len;
+		ireq.sglistinfo_ptr = (uint32_t)virt_to_phys(table);
+		ireq.sglistinfo_len = SGLISTINFO_TABLE_SIZE;
+		dmac_flush_range((void *)table,
+				(void *)table + SGLISTINFO_TABLE_SIZE);
+		cmd_buf = (void *)&ireq;
+		cmd_len = sizeof(struct qseecom_qteec_ireq);
+	} else {
+		ireq_64bit.app_id = data->client.app_id;
+		ireq_64bit.req_ptr = (uint64_t)__qseecom_uvirt_to_kphys(data,
+						(uintptr_t)req_ptr);
+		ireq_64bit.req_len = req->req_len;
+		ireq_64bit.resp_ptr = (uint64_t)__qseecom_uvirt_to_kphys(data,
+						(uintptr_t)resp_ptr);
+		ireq_64bit.resp_len = req->resp_len;
+		if ((data->client.app_arch == ELFCLASS32) &&
+			((ireq_64bit.req_ptr >=
+				PHY_ADDR_4G - ireq_64bit.req_len) ||
+			(ireq_64bit.resp_ptr >=
+				PHY_ADDR_4G - ireq_64bit.resp_len))){
+			pr_err("32bit app %s (id: %d): phy_addr exceeds 4G\n",
+				data->client.app_name, data->client.app_id);
+			pr_err("req_ptr:%llx,req_len:%x,rsp_ptr:%llx,rsp_len:%x\n",
+				ireq_64bit.req_ptr, ireq_64bit.req_len,
+				ireq_64bit.resp_ptr, ireq_64bit.resp_len);
+			return -EFAULT;
+		}
+		ireq_64bit.sglistinfo_ptr = (uint64_t)virt_to_phys(table);
+		ireq_64bit.sglistinfo_len = SGLISTINFO_TABLE_SIZE;
+		dmac_flush_range((void *)table,
+				(void *)table + SGLISTINFO_TABLE_SIZE);
+		cmd_buf = (void *)&ireq_64bit;
+		cmd_len = sizeof(struct qseecom_qteec_64bit_ireq);
+	}
+	if (qseecom.whitelist_support == true
+		&& cmd_id == QSEOS_TEE_OPEN_SESSION)
+		*(uint32_t *)cmd_buf = QSEOS_TEE_OPEN_SESSION_WHITELIST;
+	else
+		*(uint32_t *)cmd_buf = cmd_id;
+
 	reqd_len_sb_in = req->req_len + req->resp_len;
 	ret = msm_ion_do_cache_op(qseecom.ion_clnt, data->client.ihandle,
 					data->client.sb_virt,
